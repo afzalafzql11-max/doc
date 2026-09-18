@@ -1,0 +1,6 @@
+streamlit==1.49.1
+pypdf==5.9.0
+python-docx==1.2.0
+Pillow==11.3.0
+pytesseract==0.3.13
+deep-translator==1.11.4
