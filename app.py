@@ -3,11 +3,11 @@ import sqlite3
 import os
 import hashlib
 import re
+import json
+import io
 from datetime import datetime, date, timedelta
 from pathlib import Path
-import base64
-import io
-import json
+import pandas as pd
 from google import genai
 from google.genai import types
 
@@ -323,249 +323,14 @@ def document_bytes(row):
     except Exception:
         return b""
 
-# ---------- Session / auth ----------
-if "user" not in st.session_state:
-    st.session_state.user = None
-if "page" not in st.session_state:
-    st.session_state.page = "Dashboard"
+# ---------- Knowledge graph (Gemini) ----------
+# NOTE: these were previously defined *between* two `elif` branches of the
+# page-routing block below, as bare top-level statements. That is a Python
+# SyntaxError (an `elif` cannot be preceded by unrelated top-level code),
+# so the whole app would fail to even start. They now live here, safely
+# above the routing logic, and are simply called from within the
+# "Knowledge Graph" page branch.
 
-if not st.session_state.user:
-    st.markdown("""
-    <div class="hero">
-      <h1>📁 DocuVault AI</h1>
-      <p>Secure personal document organizer with OCR, English translation, validity tracking and smart reminders.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    tab1, tab2 = st.tabs(["🔐 Login", "✨ Sign up"])
-    with tab1:
-        with st.form("login_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
-            submit = st.form_submit_button("Login", use_container_width=True)
-            if submit:
-                user = authenticate(email, password)
-                if user:
-                    st.session_state.user = dict(user)
-                    st.rerun()
-                else:
-                    st.error("Invalid email or password.")
-    with tab2:
-        with st.form("signup_form"):
-            name = st.text_input("Full name")
-            email = st.text_input("Email address")
-            password = st.text_input("Create password", type="password")
-            confirm = st.text_input("Confirm password", type="password")
-            submit = st.form_submit_button("Create account", use_container_width=True)
-            if submit:
-                if not name or not email or not password:
-                    st.error("Please complete all fields.")
-                elif len(password) < 6:
-                    st.error("Password must contain at least 6 characters.")
-                elif password != confirm:
-                    st.error("Passwords do not match.")
-                else:
-                    ok, msg = create_user(name, email, password)
-                    (st.success if ok else st.error)(msg)
-    st.stop()
-
-user = st.session_state.user
-docs = get_docs(user["id"])
-
-# ---------- Sidebar ----------
-st.sidebar.title("📁 DocuVault AI")
-st.sidebar.caption(f"Signed in as {user['name']}")
-pages = ["Dashboard", "Upload & Scan", "My Documents", "Search", "Calendar", "Knowledge Graph", "Reminders"]
-for p in pages:
-    if st.sidebar.button(p, use_container_width=True):
-        st.session_state.page = p
-        st.rerun()
-if st.sidebar.button("🚪 Logout", use_container_width=True):
-    st.session_state.user = None
-    st.rerun()
-
-# ---------- Notifications ----------
-expiring = []
-for r in docs:
-    status, days = validity_status(r["expiry_date"])
-    if status in ["Expired", "Expiring Soon", "Renewal Coming"]:
-        expiring.append((r, status, days))
-
-if expiring:
-    for r, status, days in expiring[:3]:
-        if status == "Expired":
-            st.error(f"🔴 **Document expired:** {r['doc_name']} ({r['doc_type']}).")
-        elif days is not None and days <= 30:
-            st.warning(f"🟠 **Validity ending soon:** {r['doc_name']} expires in {days} day(s).")
-        else:
-            st.info(f"🔔 **Renewal reminder:** {r['doc_name']} expires in {days} day(s).")
-
-# ---------- Dashboard ----------
-if st.session_state.page == "Dashboard":
-    st.markdown(f"""
-    <div class="hero">
-      <h1>Welcome, {user['name']} 👋</h1>
-      <p>Your documents, validity dates and smart reminders in one place.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    total = len(docs)
-    valid = sum(validity_status(r["expiry_date"])[0] == "Valid" for r in docs)
-    soon = sum(validity_status(r["expiry_date"])[0] in ["Expiring Soon","Renewal Coming"] for r in docs)
-    expired = sum(validity_status(r["expiry_date"])[0] == "Expired" for r in docs)
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("📄 Documents", total)
-    c2.metric("🟢 Valid", valid)
-    c3.metric("🟠 Renewal", soon)
-    c4.metric("🔴 Expired", expired)
-
-    st.subheader("Recent documents")
-    if not docs:
-        st.info("No documents yet. Open **Upload & Scan** to add your first document.")
-    else:
-        for r in docs[:5]:
-            status, days = validity_status(r["expiry_date"])
-            badge = "good" if status == "Valid" else "warn" if status in ["Expiring Soon","Renewal Coming"] else "bad" if status=="Expired" else "info"
-            st.markdown(f"""
-            <div class="card">
-              <b>{r['doc_name']}</b> · {r['doc_type']}
-              <span class="badge {badge}">{status}</span>
-              <div class="small">Original file: {r['original_name']} · Expiry: {r['expiry_date'] or 'Not detected'}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-# ---------- Upload ----------
-elif st.session_state.page == "Upload & Scan":
-    st.title("📤 Upload & Scan Document")
-    st.caption("Upload a PDF, DOCX, TXT or image. OCR/text extraction identifies useful metadata and translation is attempted for non-English text.")
-
-    up = st.file_uploader("Choose document", type=["pdf","docx","txt","jpg","jpeg","png","webp","bmp"])
-    if up:
-        if st.button("🔎 Scan Document", type="primary"):
-            with st.spinner("Scanning document..."):
-                raw, language = extract_text(up)
-                raw = clean_text(raw)
-                translated = translate_to_english(raw)
-                doc_type = infer_type(raw, up.name)
-                doc_name = infer_name(translated or raw)
-                issue, expiry = infer_dates(translated or raw)
-                if not issue or not expiry:
-                    st.session_state.scan_result = {
-                        "raw": raw, "translated": translated, "doc_type": doc_type,
-                        "doc_name": doc_name, "language": language,
-                        "issue": issue, "expiry": expiry, "file": up
-                    }
-                else:
-                    st.session_state.scan_result = {
-                        "raw": raw, "translated": translated, "doc_type": doc_type,
-                        "doc_name": doc_name, "language": language,
-                        "issue": issue, "expiry": expiry, "file": up
-                    }
-
-    result = st.session_state.get("scan_result")
-    if result:
-        st.success("Scan completed. Review the detected information before saving.")
-        a,b,c = st.columns(3)
-        a.metric("Detected type", result["doc_type"])
-        b.metric("Detected name", result["doc_name"])
-        c.metric("Expiry", result["expiry"] or "Not detected")
-
-        st.write("**Issue date:**", result["issue"] or "Not detected")
-        st.write("**Source language:**", result["language"])
-        st.text_area("English text", result["translated"] or result["raw"] or "No text detected.", height=220)
-
-        if not result["raw"]:
-            st.warning("No selectable text was detected. For image scans, install/use the OCR dependency and ensure the OCR engine is available. The app deliberately avoids a heavy local AI model to stay suitable for Render's free tier.")
-
-        col1,col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save to My Documents", type="primary", use_container_width=True):
-                save_document(
-                    user["id"], result["file"], result["translated"] or result["raw"],
-                    result["doc_name"], result["doc_type"], result["language"],
-                    result["issue"], result["expiry"]
-                )
-                st.session_state.scan_result = None
-                st.success("Document stored successfully.")
-                st.rerun()
-        with col2:
-            if st.button("🗑️ Clear Scan", use_container_width=True):
-                st.session_state.scan_result = None
-                st.rerun()
-
-# ---------- Documents ----------
-elif st.session_state.page == "My Documents":
-    st.title("🗂️ My Documents")
-    if not docs:
-        st.info("No documents stored yet.")
-    for r in docs:
-        status, days = validity_status(r["expiry_date"])
-        with st.expander(f"📄 {r['doc_name']} — {r['doc_type']} — {status}"):
-            st.write("**Original file:**", r["original_name"])
-            st.write("**Detected name:**", r["doc_name"])
-            st.write("**Type:**", r["doc_type"])
-            st.write("**Issue date:**", r["issue_date"] or "Not detected")
-            st.write("**Validity / expiry:**", r["expiry_date"] or "Not detected")
-            st.write("**Last opened:**", r["last_opened"][:19].replace("T"," "))
-            st.write("**Uploaded:**", r["uploaded_at"][:19].replace("T"," "))
-            st.text_area("Stored English text", r["translated_text"] or "No extracted text.", height=160, key=f"text_{r['id']}")
-            data = document_bytes(r)
-            if data:
-                st.download_button("⬇️ Download original document", data=data, file_name=r["original_name"], key=f"dl_{r['id']}")
-            c1,c2 = st.columns(2)
-            with c1:
-                if st.button("👁️ Mark as opened", key=f"open_{r['id']}"):
-                    mark_opened(r["id"], user["id"])
-                    st.success("Last-opened time updated.")
-                    st.rerun()
-            with c2:
-                if st.button("🗑️ Delete", key=f"del_{r['id']}"):
-                    delete_doc(r["id"], user["id"])
-                    st.success("Document deleted.")
-                    st.rerun()
-
-# ---------- Search ----------
-elif st.session_state.page == "Search":
-    st.title("🔎 Search Documents")
-    q = st.text_input("Search by document name, type, original filename or extracted English text")
-    matches = docs
-    if q.strip():
-        ql = q.lower()
-        matches = [
-            r for r in docs if ql in " ".join([
-                r["doc_name"] or "", r["doc_type"] or "", r["original_name"] or "", r["translated_text"] or ""
-            ]).lower()
-        ]
-    st.caption(f"{len(matches)} document(s) found")
-    for r in matches:
-        status, days = validity_status(r["expiry_date"])
-        st.markdown(f"**📄 {r['doc_name']}** — {r['doc_type']} — **{status}** — expiry: {r['expiry_date'] or 'unknown'}")
-
-# ---------- Calendar ----------
-elif st.session_state.page == "Calendar":
-    st.title("📅 Document Validity Calendar")
-    selected = st.date_input("Select a date", value=date.today())
-    st.write(f"Events around **{selected.strftime('%d %b %Y')}**")
-    for r in docs:
-        if r["expiry_date"]:
-            try:
-                d = date.fromisoformat(r["expiry_date"])
-                if abs((d-selected).days) <= 31:
-                    status, days = validity_status(r["expiry_date"])
-                    st.write(f"📌 **{d.strftime('%d %b %Y')}** — {r['doc_name']} ({r['doc_type']}) — {status}")
-            except Exception:
-                pass
-
-    st.subheader("All validity dates")
-    events = [(r["doc_name"], r["doc_type"], r["issue_date"], r["expiry_date"]) for r in docs]
-    if events:
-        st.dataframe(events, use_container_width=True, column_config={
-            0:"Document", 1:"Type", 2:"Issue date", 3:"Expiry date"
-        })
-    else:
-        st.info("No validity dates detected.")
-        #-------------add3  ----------------------------------
 GRAPH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -681,7 +446,10 @@ DOCUMENT DATA:
 """ + json.dumps(document_data, ensure_ascii=False, indent=2)
 
     response = client.models.generate_content(
-        model="gemini-3.8-flash",
+        # "gemini-3.8-flash" is not a real model id (that caused every graph
+        # generation call to fail). gemini-2.5-flash is a real, currently
+        # available model well suited to this structured JSON task.
+        model="gemini-2.5-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -848,7 +616,243 @@ def graph_to_dot(graph):
 
     return "\n".join(lines)
 
-# ---------- Knowledge graph ----------
+# ---------- Session / auth ----------
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "page" not in st.session_state:
+    st.session_state.page = "Dashboard"
+
+if not st.session_state.user:
+    st.markdown("""
+    <div class="hero">
+      <h1>📁 DocuVault AI</h1>
+      <p>Secure personal document organizer with OCR, English translation, validity tracking and smart reminders.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tab1, tab2 = st.tabs(["🔐 Login", "✨ Sign up"])
+    with tab1:
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Login", use_container_width=True)
+            if submit:
+                user = authenticate(email, password)
+                if user:
+                    st.session_state.user = dict(user)
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+    with tab2:
+        with st.form("signup_form"):
+            name = st.text_input("Full name")
+            email = st.text_input("Email address")
+            password = st.text_input("Create password", type="password")
+            confirm = st.text_input("Confirm password", type="password")
+            submit = st.form_submit_button("Create account", use_container_width=True)
+            if submit:
+                if not name or not email or not password:
+                    st.error("Please complete all fields.")
+                elif len(password) < 6:
+                    st.error("Password must contain at least 6 characters.")
+                elif password != confirm:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = create_user(name, email, password)
+                    (st.success if ok else st.error)(msg)
+    st.stop()
+
+user = st.session_state.user
+docs = get_docs(user["id"])
+
+# ---------- Sidebar ----------
+st.sidebar.title("📁 DocuVault AI")
+st.sidebar.caption(f"Signed in as {user['name']}")
+pages = ["Dashboard", "Upload & Scan", "My Documents", "Search", "Calendar", "Knowledge Graph", "Reminders"]
+for p in pages:
+    if st.sidebar.button(p, use_container_width=True):
+        st.session_state.page = p
+        st.rerun()
+if st.sidebar.button("🚪 Logout", use_container_width=True):
+    st.session_state.user = None
+    st.rerun()
+
+# ---------- Notifications ----------
+expiring = []
+for r in docs:
+    status, days = validity_status(r["expiry_date"])
+    if status in ["Expired", "Expiring Soon", "Renewal Coming"]:
+        expiring.append((r, status, days))
+
+if expiring:
+    for r, status, days in expiring[:3]:
+        if status == "Expired":
+            st.error(f"🔴 **Document expired:** {r['doc_name']} ({r['doc_type']}).")
+        elif days is not None and days <= 30:
+            st.warning(f"🟠 **Validity ending soon:** {r['doc_name']} expires in {days} day(s).")
+        else:
+            st.info(f"🔔 **Renewal reminder:** {r['doc_name']} expires in {days} day(s).")
+
+# ---------- Dashboard ----------
+if st.session_state.page == "Dashboard":
+    st.markdown(f"""
+    <div class="hero">
+      <h1>Welcome, {user['name']} 👋</h1>
+      <p>Your documents, validity dates and smart reminders in one place.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    total = len(docs)
+    valid = sum(validity_status(r["expiry_date"])[0] == "Valid" for r in docs)
+    soon = sum(validity_status(r["expiry_date"])[0] in ["Expiring Soon","Renewal Coming"] for r in docs)
+    expired = sum(validity_status(r["expiry_date"])[0] == "Expired" for r in docs)
+
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("📄 Documents", total)
+    c2.metric("🟢 Valid", valid)
+    c3.metric("🟠 Renewal", soon)
+    c4.metric("🔴 Expired", expired)
+
+    st.subheader("Recent documents")
+    if not docs:
+        st.info("No documents yet. Open **Upload & Scan** to add your first document.")
+    else:
+        for r in docs[:5]:
+            status, days = validity_status(r["expiry_date"])
+            badge = "good" if status == "Valid" else "warn" if status in ["Expiring Soon","Renewal Coming"] else "bad" if status=="Expired" else "info"
+            st.markdown(f"""
+            <div class="card">
+              <b>{r['doc_name']}</b> · {r['doc_type']}
+              <span class="badge {badge}">{status}</span>
+              <div class="small">Original file: {r['original_name']} · Expiry: {r['expiry_date'] or 'Not detected'}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# ---------- Upload ----------
+elif st.session_state.page == "Upload & Scan":
+    st.title("📤 Upload & Scan Document")
+    st.caption("Upload a PDF, DOCX, TXT or image. OCR/text extraction identifies useful metadata and translation is attempted for non-English text.")
+
+    up = st.file_uploader("Choose document", type=["pdf","docx","txt","jpg","jpeg","png","webp","bmp"])
+    if up:
+        if st.button("🔎 Scan Document", type="primary"):
+            with st.spinner("Scanning document..."):
+                raw, language = extract_text(up)
+                raw = clean_text(raw)
+                translated = translate_to_english(raw)
+                doc_type = infer_type(raw, up.name)
+                doc_name = infer_name(translated or raw)
+                issue, expiry = infer_dates(translated or raw)
+                st.session_state.scan_result = {
+                    "raw": raw, "translated": translated, "doc_type": doc_type,
+                    "doc_name": doc_name, "language": language,
+                    "issue": issue, "expiry": expiry, "file": up
+                }
+
+    result = st.session_state.get("scan_result")
+    if result:
+        st.success("Scan completed. Review the detected information before saving.")
+        a,b,c = st.columns(3)
+        a.metric("Detected type", result["doc_type"])
+        b.metric("Detected name", result["doc_name"])
+        c.metric("Expiry", result["expiry"] or "Not detected")
+
+        st.write("**Issue date:**", result["issue"] or "Not detected")
+        st.write("**Source language:**", result["language"])
+        st.text_area("English text", result["translated"] or result["raw"] or "No text detected.", height=220)
+
+        if not result["raw"]:
+            st.warning("No selectable text was detected. For image scans, install/use the OCR dependency and ensure the OCR engine is available. The app deliberately avoids a heavy local AI model to stay suitable for Render's free tier.")
+
+        col1,col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save to My Documents", type="primary", use_container_width=True):
+                save_document(
+                    user["id"], result["file"], result["translated"] or result["raw"],
+                    result["doc_name"], result["doc_type"], result["language"],
+                    result["issue"], result["expiry"]
+                )
+                st.session_state.scan_result = None
+                st.success("Document stored successfully.")
+                st.rerun()
+        with col2:
+            if st.button("🗑️ Clear Scan", use_container_width=True):
+                st.session_state.scan_result = None
+                st.rerun()
+
+# ---------- Documents ----------
+elif st.session_state.page == "My Documents":
+    st.title("🗂️ My Documents")
+    if not docs:
+        st.info("No documents stored yet.")
+    for r in docs:
+        status, days = validity_status(r["expiry_date"])
+        with st.expander(f"📄 {r['doc_name']} — {r['doc_type']} — {status}"):
+            st.write("**Original file:**", r["original_name"])
+            st.write("**Detected name:**", r["doc_name"])
+            st.write("**Type:**", r["doc_type"])
+            st.write("**Issue date:**", r["issue_date"] or "Not detected")
+            st.write("**Validity / expiry:**", r["expiry_date"] or "Not detected")
+            st.write("**Last opened:**", r["last_opened"][:19].replace("T"," "))
+            st.write("**Uploaded:**", r["uploaded_at"][:19].replace("T"," "))
+            st.text_area("Stored English text", r["translated_text"] or "No extracted text.", height=160, key=f"text_{r['id']}")
+            data = document_bytes(r)
+            if data:
+                st.download_button("⬇️ Download original document", data=data, file_name=r["original_name"], key=f"dl_{r['id']}")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("👁️ Mark as opened", key=f"open_{r['id']}"):
+                    mark_opened(r["id"], user["id"])
+                    st.success("Last-opened time updated.")
+                    st.rerun()
+            with c2:
+                if st.button("🗑️ Delete", key=f"del_{r['id']}"):
+                    delete_doc(r["id"], user["id"])
+                    st.success("Document deleted.")
+                    st.rerun()
+
+# ---------- Search ----------
+elif st.session_state.page == "Search":
+    st.title("🔎 Search Documents")
+    q = st.text_input("Search by document name, type, original filename or extracted English text")
+    matches = docs
+    if q.strip():
+        ql = q.lower()
+        matches = [
+            r for r in docs if ql in " ".join([
+                r["doc_name"] or "", r["doc_type"] or "", r["original_name"] or "", r["translated_text"] or ""
+            ]).lower()
+        ]
+    st.caption(f"{len(matches)} document(s) found")
+    for r in matches:
+        status, days = validity_status(r["expiry_date"])
+        st.markdown(f"**📄 {r['doc_name']}** — {r['doc_type']} — **{status}** — expiry: {r['expiry_date'] or 'unknown'}")
+
+# ---------- Calendar ----------
+elif st.session_state.page == "Calendar":
+    st.title("📅 Document Validity Calendar")
+    selected = st.date_input("Select a date", value=date.today())
+    st.write(f"Events around **{selected.strftime('%d %b %Y')}**")
+    for r in docs:
+        if r["expiry_date"]:
+            try:
+                d = date.fromisoformat(r["expiry_date"])
+                if abs((d-selected).days) <= 31:
+                    status, days = validity_status(r["expiry_date"])
+                    st.write(f"📌 **{d.strftime('%d %b %Y')}** — {r['doc_name']} ({r['doc_type']}) — {status}")
+            except Exception:
+                pass
+
+    st.subheader("All validity dates")
+    events = [
+        {"Document": r["doc_name"], "Type": r["doc_type"], "Issue date": r["issue_date"], "Expiry date": r["expiry_date"]}
+        for r in docs
+    ]
+    if events:
+        st.dataframe(pd.DataFrame(events), use_container_width=True)
+    else:
+        st.info("No validity dates detected.")
+
 # ---------- Knowledge graph ----------
 elif st.session_state.page == "Knowledge Graph":
 
