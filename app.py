@@ -449,7 +449,7 @@ DOCUMENT DATA:
         # "gemini-3.8-flash" is not a real model id (that caused every graph
         # generation call to fail). gemini-2.5-flash is a real, currently
         # available model well suited to this structured JSON task.
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
